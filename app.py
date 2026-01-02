@@ -25,15 +25,48 @@ def extract_text_from_pdf(file):
     with pdfplumber.open(file) as pdf:
         return "\n".join([page.extract_text() or "" for page in pdf.pages])
 
+
 def analyze_cv(text, key):
     client = openai.OpenAI(api_key=key)
-    prompt = "Extrahiere aus dem CV: Name, Skills, Wohnort. Erstelle einen Google-Jobs Suchbegriff (Titel Jobs Ort). Gib NUR JSON zurück."
+    # Wir sagen der KI SEHR deutlich, wie das JSON aussehen muss
+    prompt = (
+        "Analysiere den Lebenslauf. Erstelle ein JSON mit exakt diesen Schlüsseln: "
+        "'name', 'skills', 'wohnort', 'search_query'. "
+        "Der 'search_query' muss ein Suchbegriff für Google Jobs sein (z.B. 'Projektleiter Jobs München')."
+    )
     resp = client.chat.completions.create(
         model="gpt-4o",
         messages=[{"role": "user", "content": f"{prompt}\n\n{text}"}],
         response_format={"type": "json_object"}
     )
     return json.loads(resp.choices[0].message.content)
+
+# --- LOGIK BEI KLICK (Verbessert) ---
+if st.button("🚀 Analyse starten"):
+    if not (openai_key and serpapi_key and uploaded_file):
+        st.error("Bitte alle Felder ausfüllen!")
+    else:
+        with st.spinner("Sniper analysiert den Lebenslauf..."):
+            text = extract_text_from_pdf(uploaded_file)
+            profile = analyze_cv(text, openai_key)
+            
+            # FEHLER-CHECK: Falls 'search_query' fehlt, bauen wir ihn manuell
+            query = profile.get('search_query')
+            if not query:
+                # Fallback: Jobtitel (falls da) + Ort
+                query = f"Jobs {profile.get('wohnort', 'Deutschland')}"
+            
+            st.info(f"Suche gestartet für: {query}")
+            
+            jobs = search_jobs(query, serpapi_key)
+            
+            if not jobs:
+                st.warning("Keine Jobs gefunden. Versuche es mit einem anderen Suchbegriff.")
+            else:
+                # Hier geht es weiter mit dem Matching...
+                for job in jobs[:8]:
+                    m = match_job(job, profile, openai_key)
+                    # ... restlicher Code wie gehabt
 
 def search_jobs(query, key):
     url = "https://serpapi.com/search.json"
