@@ -2,3 +2,4 @@ streamlit
 openai
 pdfplumber
 requests
+fpdf2==2.7.9
