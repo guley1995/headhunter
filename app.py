@@ -6,6 +6,7 @@ import html
 import sqlite3
 from datetime import datetime, date
 from typing import Any, Dict, List, Optional, Tuple
+import time
 
 import streamlit as st
 import pandas as pd
@@ -305,23 +306,65 @@ def get_client(oa_key: str) -> openai.OpenAI:
 # =========================
 # DB
 # =========================
+def _db_connect() -> sqlite3.Connection:
+    # Better for Streamlit Cloud / multi sessions
+    conn = sqlite3.connect(DB_PATH, timeout=30, check_same_thread=False)
+    try:
+        conn.execute("PRAGMA journal_mode=WAL;")
+        conn.execute("PRAGMA synchronous=NORMAL;")
+        conn.execute("PRAGMA foreign_keys=ON;")
+    except Exception:
+        pass
+    return conn
+
 def db_execute(sql: str, params: tuple = ()):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute(sql, params)
-    conn.commit()
-    conn.close()
+    last_err = None
+    for attempt in range(6):
+        try:
+            conn = _db_connect()
+            c = conn.cursor()
+            c.execute(sql, params)
+            conn.commit()
+            conn.close()
+            return
+        except sqlite3.OperationalError as e:
+            last_err = e
+            msg = str(e).lower()
+            try:
+                conn.close()
+            except Exception:
+                pass
+            # retry only on lock/busy
+            if "locked" in msg or "busy" in msg:
+                time.sleep(0.15 * (attempt + 1))
+                continue
+            raise
+    raise last_err
 
 
 def db_fetch_df(sql: str, params: tuple = ()) -> pd.DataFrame:
-    conn = sqlite3.connect(DB_PATH)
-    df = pd.read_sql_query(sql, conn, params=params)
-    conn.close()
-    return df
-
+    last_err = None
+    for attempt in range(6):
+        try:
+            conn = _db_connect()
+            df = pd.read_sql_query(sql, conn, params=params)
+            conn.close()
+            return df
+        except sqlite3.OperationalError as e:
+            last_err = e
+            msg = str(e).lower()
+            try:
+                conn.close()
+            except Exception:
+                pass
+            if "locked" in msg or "busy" in msg:
+                time.sleep(0.15 * (attempt + 1))
+                continue
+            raise
+    raise last_err
 
 def init_db():
-    conn = sqlite3.connect(DB_PATH)
+    conn = _db_connect()
     c = conn.cursor()
 
     c.execute("""CREATE TABLE IF NOT EXISTS leads (id INTEGER PRIMARY KEY AUTOINCREMENT)""")
@@ -411,6 +454,7 @@ def init_db():
     db_execute("UPDATE leads SET workspace_id = COALESCE(workspace_id,'default') WHERE workspace_id IS NULL OR workspace_id = ''")
     db_execute("UPDATE leads SET raw_match_percent = COALESCE(raw_match_percent, -1) WHERE raw_match_percent IS NULL")
     db_execute("UPDATE leads SET match_percent = COALESCE(match_percent, -1) WHERE match_percent IS NULL")
+
 
 
 def load_df(workspace_id: str) -> pd.DataFrame:
