@@ -12,9 +12,25 @@ import pandas as pd
 import requests
 import pdfplumber
 import openai
-from fpdf import FPDF
 
 DB_PATH = "sniper_crm.db"
+
+# =========================
+# Optional PDF backends
+# =========================
+try:
+    from fpdf import FPDF  # works with fpdf2 as well
+    HAS_FPDF = True
+except ModuleNotFoundError:
+    HAS_FPDF = False
+
+try:
+    from reportlab.lib.pagesizes import A4
+    from reportlab.pdfgen import canvas
+    from reportlab.lib.units import mm
+    HAS_REPORTLAB = True
+except Exception:
+    HAS_REPORTLAB = False
 
 
 # =========================
@@ -134,6 +150,7 @@ def fix_pdf_text(t: Any) -> str:
     }
     for k, v in replacements.items():
         s = s.replace(k, v)
+    # keep FPDF safe (cp1252)
     return s.encode("cp1252", "replace").decode("cp1252")
 
 
@@ -171,12 +188,17 @@ def looks_like_aggregator_title(title: str) -> bool:
     bad = [
         "jobs |", "jetzt", "finden sie", "offene stellen", "stellenangebote",
         "jobangebote", "jobs in", "stellen in", "top-jobs", "anzeigen", "suche",
-        "zu besetzende", "offene jobs", "stellen finden"
+        "zu besetzende", "offene jobs", "stellen finden", "auf indeed", "auf stepstone",
+        "weltweiten nr. 1", "basierend auf total visits",
     ]
     return any(b in t for b in bad)
 
 
 def is_probably_job_posting(url: str, title: str, snippet: str, source: str) -> bool:
+    """
+    Heuristik: Bei Web-Search kommen oft Listen/SEO-Seiten.
+    Diese Funktion versucht "Einzelanzeigen" zu erkennen, ohne zu hart zu filtern.
+    """
     u = (url or "").lower().strip()
     t = (title or "").lower().strip()
     sn = (snippet or "").lower().strip()
@@ -188,16 +210,21 @@ def is_probably_job_posting(url: str, title: str, snippet: str, source: str) -> 
     if not u or len(u) < 10:
         return False
 
+    # block obvious "list pages" unless URL contains job-view markers
     if looks_like_aggregator_title(t):
-        if not any(x in u for x in ["jobs/view", "viewjob", "stellenangebote", "job-listing", "jk="]):
+        if not any(x in u for x in ["jobs/view", "viewjob", "stellenangebote", "job-listing", "jk=", "currentjobid"]):
             return False
 
+    # snippets on web search can be tiny; require some content signal
+    if len(sn) < 40 and not any(x in u for x in ["jobs/view", "viewjob", "jk=", "currentjobid"]):
+        return False
+
     if "linkedin" in src:
-        return ("linkedin.com/jobs" in u) and (("jobs/view" in u) or ("currentjobid" in u) or ("jobs/search" in u))
+        return ("linkedin.com/jobs" in u) and (("jobs/view" in u) or ("currentjobid" in u))
     if "indeed" in src:
-        return ("indeed" in u) and (("viewjob" in u) or ("jk=" in u) or ("clk" in u) or ("/jobs?" in u))
+        return ("indeed" in u) and (("viewjob" in u) or ("jk=" in u) or ("/rc/clk" in u) or ("/pagead/clk" in u))
     if "stepstone" in src:
-        return ("stepstone" in u) and (("stellenangebote" in u) or ("job" in u))
+        return ("stepstone" in u) and (("stellenangebote" in u) or ("/job/" in u) or ("job/" in u))
     if "glassdoor" in src:
         return ("glassdoor" in u) and (("job-listing" in u) or ("joblisting" in u))
 
@@ -209,7 +236,10 @@ def dedupe_jobs(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     out = []
     for it in items:
         link = (it.get("link") or "").strip().lower()
-        key = link if link else ((it.get("source", "") + "|" + it.get("title", "") + "|" + it.get("snippet", ""))[:260].lower())
+        if link:
+            key = link
+        else:
+            key = ((it.get("source", "") + "|" + it.get("title", "") + "|" + it.get("snippet", ""))[:260].lower())
         if key in seen:
             continue
         seen.add(key)
@@ -217,20 +247,42 @@ def dedupe_jobs(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return out
 
 
-def score_sort_key(item: Dict[str, Any]) -> Tuple[int, int, int, int]:
+def score_sort_key(item: Dict[str, Any]) -> Tuple[int, int, int, int, int]:
     strict_mp = safe_int(item.get("_match_percent", -1), -1)
     raw_mp = safe_int(item.get("_raw_match_percent", -1), -1)
     cr = safe_int(item.get("_conf_rank", 0), 0)
     sr = safe_int(item.get("_src_rank", 0), 0)
-    return (strict_mp, raw_mp, cr, sr)
+    q = safe_int(item.get("_quality", 0), 0)  # quality of job content/page
+    return (strict_mp, raw_mp, cr, q, sr)
 
 
 def get_workspace_id() -> str:
     return st.session_state.get("workspace_id", "default")
 
 
+def _wrap_lines(text: str, max_len: int = 105) -> List[str]:
+    text = (text or "").replace("\r", "")
+    lines: List[str] = []
+    for para in text.split("\n"):
+        p = para.strip()
+        if not p:
+            lines.append("")
+            continue
+        words = p.split(" ")
+        cur = ""
+        for w in words:
+            if len(cur) + len(w) + 1 <= max_len:
+                cur = (cur + " " + w).strip()
+            else:
+                lines.append(cur)
+                cur = w
+        if cur:
+            lines.append(cur)
+    return lines
+
+
 # =========================
-# API Keys
+# API Keys / Client
 # =========================
 def get_api_keys() -> Tuple[str, str]:
     oa = st.session_state.get("OPENAI_API_KEY", "")
@@ -305,7 +357,6 @@ def init_db():
 
         "match_percent": "INTEGER",
         "raw_match_percent": "INTEGER",
-
         "match_confidence": "TEXT",
         "match_strengths": "TEXT",
         "match_gaps": "TEXT",
@@ -359,6 +410,7 @@ def init_db():
     db_execute("UPDATE leads SET mail_sent_count = COALESCE(mail_sent_count,0) WHERE mail_sent_count IS NULL")
     db_execute("UPDATE leads SET workspace_id = COALESCE(workspace_id,'default') WHERE workspace_id IS NULL OR workspace_id = ''")
     db_execute("UPDATE leads SET raw_match_percent = COALESCE(raw_match_percent, -1) WHERE raw_match_percent IS NULL")
+    db_execute("UPDATE leads SET match_percent = COALESCE(match_percent, -1) WHERE match_percent IS NULL")
 
 
 def load_df(workspace_id: str) -> pd.DataFrame:
@@ -429,6 +481,7 @@ def save_job_lead_from_queue(workspace_id: str, search: dict, job: dict, workflo
     company = job.get("company", "") or "Unbekannt"
     link = job.get("link", "")
     snippet = job.get("snippet", "") or ""
+    job_req = job.get("_job_req", {}) or {}
 
     match = job.get("_match") or {}
     strict_mp = safe_int(match.get("strict_match_percent", match.get("match_percent", -1)), -1)
@@ -474,7 +527,7 @@ def save_job_lead_from_queue(workspace_id: str, search: dict, job: dict, workflo
             search.get("docs_text", ""),
             search.get("dossier_json", ""),
             company, title, link, src, snippet,
-            safe_json_dumps(job.get("_job_req", {})),
+            safe_json_dumps(job_req),
             safe_json_dumps(match),
             strict_mp,
             raw_mp,
@@ -494,7 +547,7 @@ def export_to_excel(df: pd.DataFrame) -> bytes:
     for engine in ["openpyxl", "xlsxwriter"]:
         try:
             with pd.ExcelWriter(output, engine=engine) as writer:
-                df.to_excel(writer, index=False, sheet_name="Sniper")
+                df.to_excel(writer, index=False, sheet_name="ShortlistAI")
             return output.getvalue()
         except ModuleNotFoundError:
             output = io.BytesIO()
@@ -506,52 +559,116 @@ def export_to_excel(df: pd.DataFrame) -> bytes:
 
 
 # =========================
-# PDF
+# PDF (FPDF if available, else ReportLab, else text)
 # =========================
-class ExposePDF(FPDF):
-    def header(self):
-        self.set_font("Arial", "B", 16)
-        self.set_text_color(40, 70, 120)
-        self.cell(0, 10, fix_pdf_text("KANDIDATEN-EXPOSÉ"), 0, 1, "C")
-        self.set_font("Arial", "I", 10)
-        self.set_text_color(100, 100, 100)
-        self.cell(0, 8, fix_pdf_text("HG Mediadesign - office@hg-mediadesign.de"), 0, 1, "C")
-        self.ln(4)
-        self.line(10, 28, 200, 28)
-        self.ln(10)
+if HAS_FPDF:
 
+    class ExposePDF(FPDF):
+        def header(self):
+            self.set_font("Arial", "B", 16)
+            self.set_text_color(40, 70, 120)
+            self.cell(0, 10, fix_pdf_text("KANDIDATEN-EXPOSÉ"), 0, 1, "C")
+            self.set_font("Arial", "I", 10)
+            self.set_text_color(100, 100, 100)
+            self.cell(0, 8, fix_pdf_text("ShortlistAI"), 0, 1, "C")
+            self.ln(4)
+            self.line(10, 28, 200, 28)
+            self.ln(10)
 
-def create_candidate_pdf(row: dict) -> bytes:
-    pdf = ExposePDF()
-    pdf.add_page()
+    def create_candidate_pdf(row: dict) -> bytes:
+        pdf = ExposePDF()
+        pdf.add_page()
 
-    pdf.set_font("Arial", "B", 12)
-    pdf.cell(0, 8, fix_pdf_text(f"Kandidat: {row.get('kandidat_name','')}"), 0, 1)
+        pdf.set_font("Arial", "B", 12)
+        pdf.cell(0, 8, fix_pdf_text(f"Kandidat: {row.get('kandidat_name','')}"), 0, 1)
 
-    pdf.set_font("Arial", "", 11)
-    pdf.cell(0, 7, fix_pdf_text(f"Ort: {row.get('location','')} | Gehalt: {row.get('gehalt','')}"), 0, 1)
+        pdf.set_font("Arial", "", 11)
+        pdf.cell(0, 7, fix_pdf_text(f"Ort: {row.get('location','')} | Gehalt: {row.get('gehalt','')}"), 0, 1)
 
-    strict_mp = safe_int(row.get("match_percent"), -1)
-    raw_mp = safe_int(row.get("raw_match_percent"), -1)
-    if strict_mp >= 0 or raw_mp >= 0:
-        pdf.cell(0, 7, fix_pdf_text(f"Match: strict {strict_mp}% | raw {raw_mp}% ({row.get('match_confidence','')})"), 0, 1)
+        strict_mp = safe_int(row.get("match_percent"), -1)
+        raw_mp = safe_int(row.get("raw_match_percent"), -1)
+        conf = row.get("match_confidence", "")
+        if strict_mp >= 0 or raw_mp >= 0:
+            pdf.cell(0, 7, fix_pdf_text(f"Match: strict {strict_mp}% | raw {raw_mp}% ({conf})"), 0, 1)
 
-    pdf.ln(4)
-    pdf.set_font("Arial", "B", 11)
-    pdf.cell(0, 8, fix_pdf_text("Profil (anonymisiert):"), 0, 1)
-
-    pdf.set_font("Arial", "", 10)
-    pdf.multi_cell(0, 5, fix_pdf_text(row.get("expose_text", "") or ""))
-
-    note = row.get("berater_note", "") or ""
-    if note.strip():
-        pdf.ln(3)
+        pdf.ln(4)
         pdf.set_font("Arial", "B", 11)
-        pdf.cell(0, 8, fix_pdf_text("Berater-Notiz:"), 0, 1)
-        pdf.set_font("Arial", "", 10)
-        pdf.multi_cell(0, 5, fix_pdf_text(note))
+        pdf.cell(0, 8, fix_pdf_text("Profil (anonymisiert):"), 0, 1)
 
-    return pdf.output(dest="S").encode("cp1252", "replace")
+        pdf.set_font("Arial", "", 10)
+        pdf.multi_cell(0, 5, fix_pdf_text(row.get("expose_text", "") or ""))
+
+        note = row.get("berater_note", "") or ""
+        if note.strip():
+            pdf.ln(3)
+            pdf.set_font("Arial", "B", 11)
+            pdf.cell(0, 8, fix_pdf_text("Berater-Notiz:"), 0, 1)
+            pdf.set_font("Arial", "", 10)
+            pdf.multi_cell(0, 5, fix_pdf_text(note))
+
+        return pdf.output(dest="S").encode("cp1252", "replace")
+
+elif HAS_REPORTLAB:
+
+    def create_candidate_pdf(row: dict) -> bytes:
+        buf = io.BytesIO()
+        c = canvas.Canvas(buf, pagesize=A4)
+        w, h = A4
+        x = 18 * mm
+        y = h - 20 * mm
+
+        def draw(text: str, font="Helvetica", size=10, leading=12):
+            nonlocal y
+            c.setFont(font, size)
+            for ln in _wrap_lines(fix_pdf_text(text), max_len=110):
+                if y < 20 * mm:
+                    c.showPage()
+                    y = h - 20 * mm
+                    c.setFont(font, size)
+                c.drawString(x, y, ln)
+                y -= leading
+
+        c.setFont("Helvetica-Bold", 16)
+        c.drawCentredString(w / 2, y, "KANDIDATEN-EXPOSÉ")
+        y -= 10 * mm
+        c.setFont("Helvetica", 9)
+        c.drawCentredString(w / 2, y, "ShortlistAI")
+        y -= 12 * mm
+
+        draw(f"Kandidat: {row.get('kandidat_name','')}", font="Helvetica-Bold", size=12, leading=14)
+        draw(f"Ort: {row.get('location','')} | Gehalt: {row.get('gehalt','')}", size=10)
+
+        strict_mp = safe_int(row.get("match_percent"), -1)
+        raw_mp = safe_int(row.get("raw_match_percent"), -1)
+        conf = row.get("match_confidence", "")
+        if strict_mp >= 0 or raw_mp >= 0:
+            draw(f"Match: strict {strict_mp}% | raw {raw_mp}% ({conf})", size=10)
+
+        y -= 3 * mm
+        draw("Profil (anonymisiert):", font="Helvetica-Bold", size=11, leading=14)
+        draw(row.get("expose_text", "") or "", size=10)
+
+        note = (row.get("berater_note", "") or "").strip()
+        if note:
+            y -= 2 * mm
+            draw("Berater-Notiz:", font="Helvetica-Bold", size=11, leading=14)
+            draw(note, size=10)
+
+        c.showPage()
+        c.save()
+        return buf.getvalue()
+
+else:
+
+    def create_candidate_pdf(row: dict) -> bytes:
+        txt = (
+            f"Kandidat: {row.get('kandidat_name','')}\n"
+            f"Ort: {row.get('location','')} | Gehalt: {row.get('gehalt','')}\n"
+            f"Match: strict {row.get('match_percent','')} | raw {row.get('raw_match_percent','')} ({row.get('match_confidence','')})\n\n"
+            f"{row.get('expose_text','')}\n\n"
+            f"Notiz:\n{row.get('berater_note','')}\n"
+        )
+        return txt.encode("utf-8")
 
 
 # =========================
@@ -597,6 +714,7 @@ def fetch_site_jobs(
     gl="de",
     num=10
 ) -> List[Dict[str, Any]]:
+    # Prefer job-specific queries that tend to yield direct postings
     query = f'{site_query} "{q}" "{location}"'
     if radius_hint:
         query += f" {radius_hint}"
@@ -622,8 +740,8 @@ def fetch_job_page_text(url: str) -> str:
     if not url:
         return ""
     try:
-        headers = {"User-Agent": "Mozilla/5.0 (SniperRecruitingBot/1.0)"}
-        r = requests.get(url, headers=headers, timeout=12)
+        headers = {"User-Agent": "Mozilla/5.0 (ShortlistAI/1.0)"}
+        r = requests.get(url, headers=headers, timeout=12, allow_redirects=True)
         if r.status_code >= 400:
             return ""
         return strip_html_to_text(r.text)
@@ -631,8 +749,26 @@ def fetch_job_page_text(url: str) -> str:
         return ""
 
 
+def estimate_job_quality(text: str, url: str) -> int:
+    """
+    Quick signal for "real posting" vs thin content.
+    """
+    t = (text or "").lower()
+    u = (url or "").lower()
+    score = 0
+    if len(t) >= 1200:
+        score += 2
+    if len(t) >= 4000:
+        score += 2
+    if any(x in t for x in ["bewerben", "apply", "requirements", "anforderungen", "aufgaben", "benefits", "qualifikation"]):
+        score += 2
+    if any(x in u for x in ["jobs/view", "viewjob", "jk=", "currentjobid", "stellenangebote", "job-listing"]):
+        score += 2
+    return score
+
+
 # =========================
-# AI
+# AI: Screening + Matching
 # =========================
 def analyze_candidate_profile(oa_key: str, docs_text: str) -> dict:
     client = get_client(oa_key)
@@ -710,6 +846,11 @@ JSON:
  "constraints":["z.B. onsite, security clearance, language, travel"],
  "keywords":[]
 }
+
+Regeln:
+- Must-haves: max 10, nice-to-haves: max 10
+- weight 5 = absolut kritisch
+- wenn Jobtext dünn/SEO: gib leere Arrays zurück
 """
     resp = client.chat.completions.create(
         model="gpt-4o",
@@ -725,14 +866,15 @@ def get_match_v2(oa_key: str, candidate_dossier: dict, job_req: dict, job_text: 
 Du bist Lead-Recruiter. Gib ZWEI Scores:
 
 1) raw_match_percent (0-100):
-   - semantische Passung basierend auf Skills/Titel/Branche
+   - semantische Passung Skills/Titel/Branche
    - darf 90+ sein, auch wenn nicht jede Evidenz perfekt ist
 
 2) strict_match_percent (0-100):
    - 90+ nur wenn:
-     a) Must-Haves weight>=4 sind erfüllt
+     a) Must-Haves weight>=4 erfüllt
      b) keine Constraint-Blocker
      c) Evidence für Top-Must-Haves erkennbar
+   - wenn Jobtext dünn ist, strict darf NICHT hoch sein
 
 Gib JSON:
 {{
@@ -772,10 +914,56 @@ JOBTEXT:
         strict_mp = 89
         data["why_over_90"] = ""
 
-    data["raw_match_percent"] = raw_mp
-    data["strict_match_percent"] = strict_mp
-    data["match_percent"] = strict_mp
+    data["raw_match_percent"] = max(0, min(100, raw_mp))
+    data["strict_match_percent"] = max(0, min(100, strict_mp))
+    data["match_percent"] = data["strict_match_percent"]
     return data
+
+
+def generate_customer_mail(oa_key: str, lead_row: dict) -> str:
+    """
+    Generates a readable customer email (no sending).
+    Uses candidate expose + match summary + strengths/gaps.
+    """
+    client = get_client(oa_key)
+
+    firma = lead_row.get("firma", "Ihr Unternehmen")
+    position = lead_row.get("position", "Ihre Vakanz")
+    kandidat = lead_row.get("kandidat_name", "Kandidat")
+    expose = (lead_row.get("expose_text", "") or "").strip()
+    m = safe_json_loads(lead_row.get("match_json", "") or "") or {}
+    strict_mp = safe_int(lead_row.get("match_percent"), -1)
+    raw_mp = safe_int(lead_row.get("raw_match_percent"), -1)
+    strengths = m.get("strengths", []) or []
+    gaps = m.get("gaps", []) or []
+
+    prompt = f"""
+Schreibe eine professionelle, kurze Kundenmail (Deutsch) für eine Kandidatenvorstellung.
+Ton: seriös, Personalvermittlung. Länge: 160-220 Wörter.
+
+Kontext:
+- Kunde/Firma: {firma}
+- Stelle: {position}
+- Kandidat: {kandidat}
+- Match: strict {strict_mp}%, raw {raw_mp}%
+- Top-Strengths: {strengths[:5]}
+- Mögliche Gaps/Risiken: {gaps[:3]}
+
+Inhalt:
+- Einstieg: Bezug auf Vakanz
+- Kurzprofil (aus Exposé, anonymisiert, keine Firmennamen/PII)
+- 3 Bulletpoints: Warum passend (Strengths)
+- 1 Bulletpoint: Offener Punkt/Abklärung (falls vorhanden)
+- Call-to-Action: Termin/kurzes Gespräch
+
+Exposé:
+{truncate_text(expose, 2500)}
+"""
+    resp = client.chat.completions.create(
+        model="gpt-4o",
+        messages=[{"role": "user", "content": prompt}],
+    )
+    return resp.choices[0].message.content.strip()
 
 
 # =========================
@@ -847,7 +1035,7 @@ def load_actions_df(workspace_id: str, lead_id: int) -> pd.DataFrame:
 def render_settings():
     st.header("⚙️ Einstellungen")
 
-    st.subheader("SaaS / Workspace")
+    st.subheader("Workspace")
     ws = st.text_input("Workspace ID (default: default)", value=st.session_state.get("workspace_id", "default"))
     if st.button("Workspace setzen", use_container_width=True):
         st.session_state["workspace_id"] = ws.strip() or "default"
@@ -856,18 +1044,25 @@ def render_settings():
     st.divider()
 
     oa, sa = get_api_keys()
-    c1, c2 = st.columns(2)
+    c1, c2, c3 = st.columns(3)
     c1.metric("OpenAI Key verfügbar", "Ja" if bool(oa) else "Nein")
     c2.metric("SerpApi Key verfügbar", "Ja" if bool(sa) else "Nein")
+    c3.metric("PDF Backend", "FPDF" if HAS_FPDF else ("ReportLab" if HAS_REPORTLAB else "Text"))
 
-    st.caption("Keys: st.secrets / ENV. Optional Session-Override.")
+    st.caption("Empfohlen: Keys in Streamlit Secrets/ENV. Session-Override ist nur temporär (Browser-Session).")
 
     with st.form("settings_form"):
         override = st.toggle("Session-Override aktivieren", value=False)
-        oa_in = st.text_input("OpenAI API Key (nur Session)", type="password",
-                              value="" if not override else st.session_state.get("OPENAI_API_KEY", ""))
-        sa_in = st.text_input("SerpApi Key (nur Session)", type="password",
-                              value="" if not override else st.session_state.get("SERPAPI_API_KEY", ""))
+        oa_in = st.text_input(
+            "OpenAI API Key (nur Session)",
+            type="password",
+            value="" if not override else st.session_state.get("OPENAI_API_KEY", ""),
+        )
+        sa_in = st.text_input(
+            "SerpApi Key (nur Session)",
+            type="password",
+            value="" if not override else st.session_state.get("SERPAPI_API_KEY", ""),
+        )
         ok = st.form_submit_button("Speichern")
 
     if ok:
@@ -915,7 +1110,7 @@ def render_dashboard(workspace_id: str):
     d.metric("💰 Dein Anteil", f"{float(total_share):,.2f} €")
 
     st.divider()
-    st.subheader("Pipeline Funnel")
+    st.subheader("Pipeline")
     statuses = ["Screening", "Hot", "Offen", "Kontaktiert", "Interview", "Placement", "Abgelehnt"]
     counts = {s: int((df["status"] == s).sum()) for s in statuses}
     funnel_df = pd.DataFrame([{"Status": s, "Count": counts[s]} for s in statuses])
@@ -941,6 +1136,7 @@ def render_screening(workspace_id: str, oa_key: str):
         type=["pdf"],
         accept_multiple_files=True,
     )
+    st.caption("Wenn PDFs gescannt sind (kein Text), paste unten optional den Text manuell rein.")
 
     if st.button("🔄 Screening Reset", use_container_width=True):
         for k in ["docs_text", "screening_data", "dossier_json", "active_search", "candidate_group_id"]:
@@ -948,29 +1144,43 @@ def render_screening(workspace_id: str, oa_key: str):
         st.success("Reset erledigt.")
         st.rerun()
 
-    if not files:
-        st.info("Bitte PDFs hochladen.")
+    manual_text = st.text_area("Optional: Text manuell einfügen (wenn Scan-PDF)", value="", height=150)
+
+    if not files and not manual_text.strip():
+        st.info("Bitte PDFs hochladen oder Text einfügen.")
         return
 
     if "docs_text" not in st.session_state:
         with st.spinner("Extrahiere Text aus PDFs..."):
-            st.session_state.docs_text = extract_text_from_pdfs(files)
+            extracted = extract_text_from_pdfs(files) if files else ""
+            st.session_state.docs_text = (extracted + "\n\n" + manual_text).strip()
 
-    docs_text = st.session_state.docs_text
+    docs_text = (st.session_state.docs_text or "").strip()
+    if manual_text.strip() and manual_text.strip() not in docs_text:
+        docs_text = (docs_text + "\n\n" + manual_text).strip()
+        st.session_state.docs_text = docs_text
+
     if not docs_text:
-        st.error("Konnte keinen Text extrahieren. (Scan-PDF?)")
+        st.error("Konnte keinen Text extrahieren. (Scan-PDF?) – bitte Text manuell einfügen.")
         return
 
     st.subheader("🤖 Automatische Analyse")
-    colA, colB = st.columns([1, 1])
+    colA, colB, colC = st.columns([1, 1, 1])
     if colA.button("Profil automatisch erzeugen", use_container_width=True):
         with st.spinner("Analysiere Unterlagen..."):
             st.session_state.screening_data = analyze_candidate_profile(oa_key, docs_text)
         st.success("Analyse erstellt.")
 
-    if colB.button("Analyse zurücksetzen", use_container_width=True):
+    if colB.button("Dossier erstellen/aktualisieren", use_container_width=True):
+        with st.spinner("Erstelle Dossier..."):
+            dossier = build_candidate_dossier(oa_key, docs_text)
+            st.session_state.dossier_json = safe_json_dumps(dossier)
+        st.success("Dossier erstellt.")
+
+    if colC.button("Analyse zurücksetzen", use_container_width=True):
         st.session_state.pop("screening_data", None)
-        st.success("Analyse zurückgesetzt.")
+        st.session_state.pop("dossier_json", None)
+        st.success("Zurückgesetzt.")
         st.rerun()
 
     d = st.session_state.get("screening_data", {}) or {}
@@ -992,13 +1202,6 @@ def render_screening(workspace_id: str, oa_key: str):
     st.session_state.candidate_group_id = group_id
 
     st.divider()
-    st.subheader("📦 Dossier (aus allen Dokumenten)")
-    if st.button("Dossier erstellen/aktualisieren", use_container_width=True):
-        with st.spinner("Erstelle Dossier..."):
-            dossier = build_candidate_dossier(oa_key, docs_text)
-            st.session_state.dossier_json = safe_json_dumps(dossier)
-        st.success("Dossier erstellt.")
-
     if st.session_state.get("dossier_json"):
         with st.expander("Dossier ansehen (JSON)"):
             st.json(safe_json_loads(st.session_state.dossier_json) or {})
@@ -1101,35 +1304,38 @@ def render_market_scan(workspace_id: str, oa_key: str, sa_key: str):
 
     r1, r2 = st.columns([1, 2])
     radius_km = r1.slider("Umkreis (km)", 0, 150, 50, 5)
-    radius_mode = r2.selectbox("Radius-Strategie", ["Query erweitern (empfohlen)", "Aus (0 km)"],
-                               index=0 if radius_km > 0 else 1)
+    radius_mode = r2.selectbox(
+        "Radius-Strategie",
+        ["Query erweitern (best effort)", "Aus (0 km)"],
+        index=0 if radius_km > 0 else 1
+    )
 
     radius_hint_web = ""
     radius_hint_jobs = ""
     if radius_km > 0 and "Query" in radius_mode:
-        radius_hint_web = f' ("Umkreis {radius_km} km" OR "within {radius_km} km" OR "{radius_km} km")'
+        radius_hint_web = f' ("Umkreis {radius_km} km" OR "{radius_km} km" OR "within {radius_km} km")'
         radius_hint_jobs = f" Umkreis {radius_km} km"
 
     if radius_km > 0 and "Query" in radius_mode:
-        st.info(f"📍 Radius aktiv: {radius_km} km um {l}")
+        st.info(f"📍 Radius aktiv: {radius_km} km um {l} (Hinweis: Web-Search Radius ist best effort)")
 
     st.caption("Quellen")
     s1, s2, s3, s4 = st.columns(4)
-    use_google_jobs = s1.toggle("Google Jobs", value=True)
-    use_linkedin = s2.toggle("LinkedIn", value=True)
-    use_indeed = s3.toggle("Indeed", value=True)
-    use_stepstone = s4.toggle("StepStone", value=True)
+    use_google_jobs = s1.toggle("Google Jobs (real)", value=True)
+    use_linkedin = s2.toggle("LinkedIn (web)", value=True)
+    use_indeed = s3.toggle("Indeed (web)", value=True)
+    use_stepstone = s4.toggle("StepStone (web)", value=True)
 
     st.divider()
     a, b, c = st.columns(3)
     max_results = a.slider("Max Ergebnisse (gesamt)", 10, 120, 40, 10)
     per_board = b.slider("Max pro Quelle", 5, 30, 10, 5)
-    only_real = c.toggle("✅ Nur echte Einzelanzeigen (relaxed)", value=True)
+    only_real = c.toggle("✅ Nur echte Einzelanzeigen (strict)", value=True)
 
     st.divider()
-    st.subheader("Matching v2.1")
+    st.subheader("Matching")
     auto_match = st.toggle("Auto-Match berechnen", value=True)
-    fetch_pages = st.toggle("🔎 Job-Seite laden (stark empfohlen)", value=True)
+    fetch_pages = st.toggle("🔎 Job-Seite laden (empfohlen)", value=True)
 
     hot_threshold = st.slider("Hot Threshold (strict %)", 80, 99, 90, 1)
     min_conf = st.selectbox("Min Confidence für Hot", ["medium", "high"], index=0)
@@ -1155,7 +1361,7 @@ def render_market_scan(workspace_id: str, oa_key: str, sa_key: str):
                 if use_linkedin:
                     all_jobs += fetch_site_jobs(
                         sa_key, qi, l,
-                        'site:linkedin.com/jobs',
+                        'site:linkedin.com/jobs (jobs/view OR currentjobid)',
                         "LinkedIn",
                         radius_hint=radius_hint_web,
                         num=per_board
@@ -1163,7 +1369,7 @@ def render_market_scan(workspace_id: str, oa_key: str, sa_key: str):
                 if use_indeed:
                     all_jobs += fetch_site_jobs(
                         sa_key, qi, l,
-                        '(site:indeed.com OR site:indeed.de)',
+                        '(site:indeed.com OR site:indeed.de) (viewjob OR jk=)',
                         "Indeed",
                         radius_hint=radius_hint_web,
                         num=per_board
@@ -1171,7 +1377,7 @@ def render_market_scan(workspace_id: str, oa_key: str, sa_key: str):
                 if use_stepstone:
                     all_jobs += fetch_site_jobs(
                         sa_key, qi, l,
-                        'site:stepstone.de',
+                        'site:stepstone.de (stellenangebote OR job)',
                         "StepStone",
                         radius_hint=radius_hint_web,
                         num=per_board
@@ -1191,7 +1397,7 @@ def render_market_scan(workspace_id: str, oa_key: str, sa_key: str):
             all_jobs = kept
 
         if not all_jobs:
-            st.warning("Filter war zu streng → zeige ungefilterte Treffer (deaktiviere Filter für mehr).")
+            st.warning("Filter war zu streng → verwende ungefilterte Treffer (toggle deaktivieren für mehr).")
             all_jobs = all_jobs_raw
 
         if not all_jobs:
@@ -1206,12 +1412,15 @@ def render_market_scan(workspace_id: str, oa_key: str, sa_key: str):
                 j["_src_rank"] = source_rank(src)
 
                 base_text = f"{j.get('title','')}\n{j.get('snippet','')}".strip()
-                need_page = (len(base_text) < 600)
+                need_page = (len(base_text) < 700)
 
+                page_txt = ""
                 if (fetch_pages or need_page) and j.get("link"):
                     page_txt = fetch_job_page_text(j["link"])
                     if page_txt:
                         base_text = base_text + "\n\n[PAGE]\n" + page_txt[:30000]
+
+                j["_quality"] = estimate_job_quality(page_txt or base_text, j.get("link", ""))
 
                 j["_job_text"] = base_text
                 j["_job_req"] = {}
@@ -1284,6 +1493,7 @@ def render_review_queue(workspace_id: str):
         items.sort(key=lambda x: (safe_int(x.get("_raw_match_percent", -1), -1),
                                   safe_int(x.get("_match_percent", -1), -1),
                                   safe_int(x.get("_conf_rank", 0), 0),
+                                  safe_int(x.get("_quality", 0), 0),
                                   safe_int(x.get("_src_rank", 0), 0)), reverse=True)
     elif sort_mode == "Quelle":
         items.sort(key=lambda x: (x.get("_src_rank", 0), x.get("_match_percent", -1)), reverse=True)
@@ -1306,6 +1516,7 @@ def render_review_queue(workspace_id: str):
         raw_mp = safe_int(job.get("_raw_match_percent", -1), -1)
         conf = (job.get("_match", {}) or {}).get("confidence", "")
         hot_flag = bool(job.get("_hot"))
+        quality = safe_int(job.get("_quality", 0), 0)
 
         with st.container(border=True):
             top = st.columns([0.6, 6, 1.4, 1.4])
@@ -1321,6 +1532,8 @@ def render_review_queue(workspace_id: str):
                 label += f" — 🎯 strict {strict_mp}% | ⚡ raw {raw_mp}% ({conf})"
             if hot_flag:
                 label += " — 🔥 HOT"
+            if quality >= 6:
+                label += " — ✅ page"
             top[1].markdown(label)
             top[1].caption(f"Quelle: {src} | Firma: {company}")
 
@@ -1410,7 +1623,7 @@ def render_workflows(workspace_id: str):
 
     st.subheader("Jobs (strict bester zuerst, dann raw)")
     show_cols = [c for c in ["status", "match_percent", "raw_match_percent", "match_confidence", "firma", "position", "source", "link"] if c in df_jobs.columns]
-    st.dataframe(df_jobs[show_cols], use_container_width=True)
+    st.dataframe(df_jobs[show_cols], use_container_width=True, hide_index=True)
 
     st.divider()
     st.subheader("Abarbeiten (Next Best)")
@@ -1446,7 +1659,7 @@ def render_workflows(workspace_id: str):
 # =========================
 # UI: Kanban
 # =========================
-def render_kanban(workspace_id: str):
+def render_kanban(workspace_id: str, oa_key: str):
     st.header("📋 Kanban")
 
     df = load_df(workspace_id)
@@ -1456,7 +1669,7 @@ def render_kanban(workspace_id: str):
 
     with st.expander("Export"):
         data = export_to_excel(df)
-        filename = "Sniper.xlsx" if data[:2] == b"PK" else "Sniper.csv"
+        filename = "ShortlistAI.xlsx" if data[:2] == b"PK" else "ShortlistAI.csv"
         st.download_button("Download", data, file_name=filename)
 
     st.divider()
@@ -1502,22 +1715,49 @@ def render_kanban(workspace_id: str):
 
                 with st.expander("Details"):
                     tab1, tab2, tab3 = st.tabs(["Profil", "Match", "Audit"])
+
                     with tab1:
                         st.write(f"**Quelle:** {row.get('source','')}")
                         st.write(f"**Ort:** {row.get('location','')} | **Gehalt:** {row.get('gehalt','')}")
                         st.write(f"**Skills:** {row.get('skills','')}")
-                        st.text_area("Exposé", value=row.get("expose_text","") or "", height=150, key=f"exp_{lead_id}")
+                        st.text_area("Exposé", value=row.get("expose_text","") or "", height=160, key=f"exp_{lead_id}")
 
                         ms = safe_int(row.get("mail_sent_count"), 0)
                         ml = row.get("mail_last_sent_date","") or ""
                         st.caption(f"📧 Mail sent: {ms} | last: {ml}")
-                        if st.button("✅ Mail als gesendet zählen", key=f"mail_{lead_id}"):
+
+                        btnA, btnB = st.columns(2)
+                        if btnA.button("✅ Mail als gesendet zählen", key=f"mail_{lead_id}", use_container_width=True):
                             increment_mail_sent(workspace_id, lead_id)
                             st.toast("Gezählt.")
                             st.rerun()
 
                         pdf_data = create_candidate_pdf(row)
-                        st.download_button("📥 PDF Exposé", pdf_data, file_name=f"HG_{name or lead_id}.pdf", key=f"pdf_{lead_id}")
+                        btnB.download_button(
+                            "📥 PDF Exposé",
+                            pdf_data,
+                            file_name=f"ShortlistAI_{name or lead_id}.pdf",
+                            key=f"pdf_{lead_id}",
+                            use_container_width=True
+                        )
+
+                        st.divider()
+                        if row.get("source","") != "Screening":
+                            if st.button("✉️ Kundenmail generieren", key=f"custmail_{lead_id}", use_container_width=True):
+                                with st.spinner("Generiere Mail..."):
+                                    mail = generate_customer_mail(oa_key, row)
+                                st.session_state[f"custmail_text_{lead_id}"] = mail
+
+                            mail_txt = st.session_state.get(f"custmail_text_{lead_id}", "")
+                            if mail_txt:
+                                st.text_area("Kundenmail (Copy/Paste)", value=mail_txt, height=220, key=f"custmail_area_{lead_id}")
+                                st.download_button(
+                                    "Download Mail (.txt)",
+                                    mail_txt.encode("utf-8"),
+                                    file_name=f"Kundenmail_{name}_{lead_id}.txt",
+                                    key=f"custmail_dl_{lead_id}",
+                                    use_container_width=True
+                                )
 
                     with tab2:
                         m = safe_json_loads(row.get("match_json","") or "") or {}
@@ -1633,10 +1873,10 @@ def render_billing(workspace_id: str):
 # MAIN
 # =========================
 def main():
-    st.set_page_config(page_title="Sniper SaaS (Match Fix + Radius)", layout="wide")
+    st.set_page_config(page_title="ShortlistAI", layout="wide")
     init_db()
 
-    st.sidebar.title("🎯 Sniper SaaS")
+    st.sidebar.title("🧠 ShortlistAI")
     nav = st.sidebar.radio(
         "Menü",
         ["Dashboard", "Screening", "Markt-Scan", "Review-Queue", "Workflows", "Kanban", "Placements & Abrechnung", "Einstellungen"]
@@ -1665,7 +1905,7 @@ def main():
     elif nav == "Workflows":
         render_workflows(workspace_id)
     elif nav == "Kanban":
-        render_kanban(workspace_id)
+        render_kanban(workspace_id, oa_key)
     elif nav == "Placements & Abrechnung":
         render_billing(workspace_id)
     else:
