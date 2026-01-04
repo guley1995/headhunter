@@ -138,6 +138,25 @@ def normalize_source_label(src: str) -> str:
     return src or ""
 
 
+def title_matches_any_query(title: str, queries: List[str]) -> bool:
+    """
+    Strict: Titel muss alle Query-Wörter enthalten.
+    Beispiel Query: "ingenieur maschinenbau" -> beide Wörter müssen im Titel vorkommen.
+    """
+    t = (title or "").lower()
+    t = re.sub(r"\s+", " ", t).strip()
+    for q in queries:
+        qn = (q or "").lower().strip()
+        if not qn:
+            continue
+        words = re.findall(r"[a-z0-9äöüß]+", qn)
+        if not words:
+            continue
+        if all(w in t for w in words):
+            return True
+    return False
+
+
 def fix_pdf_text(t: Any) -> str:
     if t is None:
         return ""
@@ -151,7 +170,6 @@ def fix_pdf_text(t: Any) -> str:
     }
     for k, v in replacements.items():
         s = s.replace(k, v)
-    # keep FPDF safe (cp1252)
     return s.encode("cp1252", "replace").decode("cp1252")
 
 
@@ -196,10 +214,6 @@ def looks_like_aggregator_title(title: str) -> bool:
 
 
 def is_probably_job_posting(url: str, title: str, snippet: str, source: str) -> bool:
-    """
-    Heuristik: Bei Web-Search kommen oft Listen/SEO-Seiten.
-    Diese Funktion versucht "Einzelanzeigen" zu erkennen, ohne zu hart zu filtern.
-    """
     u = (url or "").lower().strip()
     t = (title or "").lower().strip()
     sn = (snippet or "").lower().strip()
@@ -211,12 +225,10 @@ def is_probably_job_posting(url: str, title: str, snippet: str, source: str) -> 
     if not u or len(u) < 10:
         return False
 
-    # block obvious "list pages" unless URL contains job-view markers
     if looks_like_aggregator_title(t):
         if not any(x in u for x in ["jobs/view", "viewjob", "stellenangebote", "job-listing", "jk=", "currentjobid"]):
             return False
 
-    # snippets on web search can be tiny; require some content signal
     if len(sn) < 40 and not any(x in u for x in ["jobs/view", "viewjob", "jk=", "currentjobid"]):
         return False
 
@@ -253,7 +265,7 @@ def score_sort_key(item: Dict[str, Any]) -> Tuple[int, int, int, int, int]:
     raw_mp = safe_int(item.get("_raw_match_percent", -1), -1)
     cr = safe_int(item.get("_conf_rank", 0), 0)
     sr = safe_int(item.get("_src_rank", 0), 0)
-    q = safe_int(item.get("_quality", 0), 0)  # quality of job content/page
+    q = safe_int(item.get("_quality", 0), 0)
     return (strict_mp, raw_mp, cr, q, sr)
 
 
@@ -307,7 +319,6 @@ def get_client(oa_key: str) -> openai.OpenAI:
 # DB
 # =========================
 def _db_connect() -> sqlite3.Connection:
-    # Better for Streamlit Cloud / multi sessions
     conn = sqlite3.connect(DB_PATH, timeout=30, check_same_thread=False)
     try:
         conn.execute("PRAGMA journal_mode=WAL;")
@@ -316,6 +327,7 @@ def _db_connect() -> sqlite3.Connection:
     except Exception:
         pass
     return conn
+
 
 def db_execute(sql: str, params: tuple = ()):
     last_err = None
@@ -334,7 +346,6 @@ def db_execute(sql: str, params: tuple = ()):
                 conn.close()
             except Exception:
                 pass
-            # retry only on lock/busy
             if "locked" in msg or "busy" in msg:
                 time.sleep(0.15 * (attempt + 1))
                 continue
@@ -362,6 +373,7 @@ def db_fetch_df(sql: str, params: tuple = ()) -> pd.DataFrame:
                 continue
             raise
     raise last_err
+
 
 def init_db():
     conn = _db_connect()
@@ -454,7 +466,6 @@ def init_db():
     db_execute("UPDATE leads SET workspace_id = COALESCE(workspace_id,'default') WHERE workspace_id IS NULL OR workspace_id = ''")
     db_execute("UPDATE leads SET raw_match_percent = COALESCE(raw_match_percent, -1) WHERE raw_match_percent IS NULL")
     db_execute("UPDATE leads SET match_percent = COALESCE(match_percent, -1) WHERE match_percent IS NULL")
-
 
 
 def load_df(workspace_id: str) -> pd.DataFrame:
@@ -579,7 +590,7 @@ def save_job_lead_from_queue(workspace_id: str, search: dict, job: dict, workflo
             safe_json_dumps(strengths),
             safe_json_dumps(gaps),
             hot_reason,
-            0,  # mail_sent_count
+            0,
         )
     )
 
@@ -759,7 +770,6 @@ def fetch_site_jobs(
     gl="de",
     num=10
 ) -> List[Dict[str, Any]]:
-    # Prefer job-specific queries that tend to yield direct postings
     query = f'{site_query} "{q}" "{location}"'
     if radius_hint:
         query += f" {radius_hint}"
@@ -795,9 +805,6 @@ def fetch_job_page_text(url: str) -> str:
 
 
 def estimate_job_quality(text: str, url: str) -> int:
-    """
-    Quick signal for "real posting" vs thin content.
-    """
     t = (text or "").lower()
     u = (url or "").lower()
     score = 0
@@ -966,10 +973,6 @@ JOBTEXT:
 
 
 def generate_customer_mail(oa_key: str, lead_row: dict) -> str:
-    """
-    Generates a readable customer email (no sending).
-    Uses candidate expose + match summary + strengths/gaps.
-    """
     client = get_client(oa_key)
 
     firma = lead_row.get("firma", "Ihr Unternehmen")
@@ -1377,6 +1380,11 @@ def render_market_scan(workspace_id: str, oa_key: str, sa_key: str):
     per_board = b.slider("Max pro Quelle", 5, 30, 10, 5)
     only_real = c.toggle("✅ Nur echte Einzelanzeigen (strict)", value=True)
 
+    # ✅ NEW: Title sanity filter toggle (default ON)
+    st.divider()
+    title_must_match = st.toggle("🎯 Titel muss Suchbegriff enthalten", value=st.session_state.get("title_must_match", True))
+    st.session_state["title_must_match"] = title_must_match
+
     st.divider()
     st.subheader("Matching")
     auto_match = st.toggle("Auto-Match berechnen", value=True)
@@ -1441,9 +1449,17 @@ def render_market_scan(workspace_id: str, oa_key: str, sa_key: str):
                     kept.append(j)
             all_jobs = kept
 
+        # ✅ NEW: kill off-topic results (e.g., Pflegefachkraft when query is "ingenieur")
+        if title_must_match:
+            all_jobs = [j for j in all_jobs if title_matches_any_query(j.get("title", ""), queries)]
+
         if not all_jobs:
             st.warning("Filter war zu streng → verwende ungefilterte Treffer (toggle deaktivieren für mehr).")
             all_jobs = all_jobs_raw
+
+        # even in fallback, re-apply title filter if enabled (so you never see nonsense)
+        if title_must_match:
+            all_jobs = [j for j in all_jobs if title_matches_any_query(j.get("title", ""), queries)]
 
         if not all_jobs:
             st.warning("Keine Ergebnisse. Jobtitel/Standort ändern.")
