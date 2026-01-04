@@ -555,7 +555,7 @@ def save_job_lead_from_queue(workspace_id: str, search: dict, job: dict, workflo
             job_req_json, match_json,
             match_percent, raw_match_percent, match_confidence, match_strengths, match_gaps, hot_reason,
             mail_sent_count)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             workspace_id,
@@ -579,6 +579,7 @@ def save_job_lead_from_queue(workspace_id: str, search: dict, job: dict, workflo
             safe_json_dumps(strengths),
             safe_json_dumps(gaps),
             hot_reason,
+            0,  # mail_sent_count
         )
     )
 
