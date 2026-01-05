@@ -138,15 +138,14 @@ def normalize_source_label(src: str) -> str:
     return src or ""
 
 
-def _tokenize(s: str) -> List[str]:
-    s = (s or "").lower()
-    return re.findall(r"[a-z0-9äöüß]+", s)
+def _tokenize_words(s: str) -> List[str]:
+    return re.findall(r"[a-z0-9äöüß]+", (s or "").lower())
 
 
 def title_matches_any_query(title: str, queries: List[str]) -> bool:
     """
-    STRICT title gate: requires that ALL words of any query are in the title.
-    Example: query 'ingenieur maschinenbau' => title must contain both.
+    STRICT: requires ALL words of at least one query inside title.
+    Great to remove irrelevant results (e.g. Pflege) when query is "ingenieur".
     """
     t = (title or "").lower()
     t = re.sub(r"\s+", " ", t).strip()
@@ -154,7 +153,7 @@ def title_matches_any_query(title: str, queries: List[str]) -> bool:
         qn = (q or "").lower().strip()
         if not qn:
             continue
-        words = _tokenize(qn)
+        words = _tokenize_words(qn)
         if not words:
             continue
         if all(w in t for w in words):
@@ -162,104 +161,16 @@ def title_matches_any_query(title: str, queries: List[str]) -> bool:
     return False
 
 
-def looks_technical_query(queries: List[str], booster: str = "") -> bool:
-    txt = " ".join(queries + [booster]).lower()
-    tech_markers = [
-        "ingenieur", "engineer", "engineering", "maschinenbau", "mechatronik",
-        "elektro", "software", "test", "testing", "validation", "verifikation",
-        "calibration", "kalibrier", "automotive", "aerospace", "luft", "raumfahrt",
-        "quality", "qa", "data", "analyse", "python", "opencv", "vba"
-    ]
-    return any(m in txt for m in tech_markers)
-
-
-def is_banned_by_irrelevance(title: str, queries: List[str], booster: str = "") -> bool:
+def text_matches_query_soft(text: str, queries: List[str]) -> bool:
     """
-    Prevent obvious off-topic stuff like Pflege when the query is technical.
-    Only applies when the query looks technical.
+    SOFT: at least ONE word of any query appears in text.
     """
-    if not looks_technical_query(queries, booster):
-        return False
-
-    t = (title or "").lower()
-    banned = [
-        "pflege", "krankenpfleger", "pflegefachkraft", "altenpfleger",
-        "medizin", "arzt", "klinikum", "hospital", "nurse", "heilerziehung",
-        "hebamme", "zahnarzt", "pharma", "apotheke"
-    ]
-    return any(b in t for b in banned)
-
-
-def build_query_variants(base_queries: List[str], booster: str, dossier: Optional[dict]) -> List[str]:
-    """
-    Build better search queries:
-    - keep user queries
-    - add dossier target titles
-    - add smart variants for generic queries
-    - add booster keywords lightly (not too strict)
-    """
-    out: List[str] = []
-
-    base_queries = [q.strip() for q in base_queries if q and q.strip()]
-    booster = (booster or "").strip()
-
-    # Dossier-based titles
-    dossier_titles: List[str] = []
-    if isinstance(dossier, dict):
-        for k in ["target_titles", "target_title", "job_titles"]:
-            v = dossier.get(k)
-            if isinstance(v, list):
-                dossier_titles += [str(x).strip() for x in v if str(x).strip()]
-    dossier_titles = [x for x in dossier_titles if len(x) >= 3]
-
-    out += base_queries
-    out += dossier_titles[:8]
-
-    # If query too generic, add role synonyms that often match Tolga-like CVs
-    # (Testing/Calibration/Validation/Mechanical/Vehicle lab)
-    generic = {"ingenieur", "engineering", "engineer", "engineering consultant", "consultant"}
-    for q in base_queries:
-        ql = q.lower().strip()
-        if ql in generic or len(_tokenize(ql)) <= 1:
-            out += [
-                "test engineer",
-                "testingenieur",
-                "validation engineer",
-                "verifikation engineer",
-                "calibration engineer",
-                "kalibrierung ingenieur",
-                "quality engineer",
-                "qa engineer",
-                "environmental test engineer",
-                "umwelttest",
-                "mechanical test engineer",
-                "structural test engineer",
-                "prüfingenieur",
-            ]
-
-    # Add light booster combos (NOT too strict: keep as separate variants)
-    booster_tokens = _tokenize(booster)[:10]
-    if booster_tokens:
-        for q in base_queries[:4]:
-            qt = q.strip()
-            if qt:
-                out.append(f"{qt} {' '.join(booster_tokens[:3])}".strip())
-        # also a pure booster query can be useful
-        out.append(" ".join(booster_tokens[:5]).strip())
-
-    # Deduplicate and keep sane length
-    cleaned = []
-    seen = set()
-    for q in out:
-        q = re.sub(r"\s+", " ", (q or "").strip())
-        if not q:
-            continue
-        key = q.lower()
-        if key in seen:
-            continue
-        seen.add(key)
-        cleaned.append(q)
-    return cleaned[:25]
+    tx = (text or "").lower()
+    for q in queries:
+        words = _tokenize_words(q)
+        if any(w in tx for w in words if w):
+            return True
+    return False
 
 
 def fix_pdf_text(t: Any) -> str:
@@ -319,6 +230,10 @@ def looks_like_aggregator_title(title: str) -> bool:
 
 
 def is_probably_job_posting(url: str, title: str, snippet: str, source: str) -> bool:
+    """
+    Heuristik: Bei Web-Search kommen oft Listen/SEO-Seiten.
+    Diese Funktion versucht "Einzelanzeigen" zu erkennen.
+    """
     u = (url or "").lower().strip()
     t = (title or "").lower().strip()
     sn = (snippet or "").lower().strip()
@@ -720,7 +635,7 @@ def export_to_excel(df: pd.DataFrame) -> bytes:
 
 
 # =========================
-# PDF (FPDF if available, else ReportLab, else text)
+# PDF
 # =========================
 if HAS_FPDF:
 
@@ -846,8 +761,11 @@ def serpapi_get(params: Dict[str, Any]) -> Dict[str, Any]:
     return serpapi_get_cached(params_tuple)
 
 
-def fetch_google_jobs(sa_key: str, q: str, location: str, hl="de", gl="de") -> List[Dict[str, Any]]:
+def fetch_google_jobs(sa_key: str, q: str, location: str, radius_km: int = 0, hl="de", gl="de") -> List[Dict[str, Any]]:
+    # NOTE: SerpApi's google_jobs supports various params. Unknown params are ignored.
     params = {"engine": "google_jobs", "q": q, "location": location, "api_key": sa_key, "hl": hl, "gl": gl}
+    if radius_km and radius_km > 0:
+        params["lrad"] = str(radius_km)  # best effort (ignored if unsupported)
     res = serpapi_get(params)
     jobs = res.get("jobs_results", []) or []
     out = []
@@ -858,32 +776,10 @@ def fetch_google_jobs(sa_key: str, q: str, location: str, hl="de", gl="de") -> L
             "company": j.get("company_name", "") or "Unbekannt",
             "location": j.get("location", "") or location,
             "link": j.get("link", "") or "",
-            "snippet": (j.get("description") or j.get("snippet") or "")[:1500],
+            "snippet": (j.get("description") or j.get("snippet") or "")[:2500],
             "raw": j,
         })
     return out
-
-
-def _build_web_query(site_query: str, q: str, location: str, radius_hint: str, booster: str) -> str:
-    """
-    Build a Google Web query that's not over-quoted.
-    - site_query already has site:domain and maybe (jobs/view OR ...)
-    - q + location should be loose to avoid 0 results
-    """
-    q = (q or "").strip()
-    location = (location or "").strip()
-    booster = (booster or "").strip()
-
-    parts = [site_query]
-    if q:
-        parts.append(q)
-    if location:
-        parts.append(location)
-    if booster:
-        parts.append(booster)
-    if radius_hint:
-        parts.append(radius_hint)
-    return " ".join([p for p in parts if p]).strip()
 
 
 def fetch_site_jobs(
@@ -893,23 +789,22 @@ def fetch_site_jobs(
     site_query: str,
     label: str,
     radius_hint: str = "",
-    booster: str = "",
+    boosters: str = "",
     hl="de",
     gl="de",
     num=10
 ) -> List[Dict[str, Any]]:
-    query = _build_web_query(site_query, q, location, radius_hint, booster)
+    # Keep q in quotes for precision; boosters outside quotes to widen with signals.
+    boosters2 = (boosters or "").strip()
+    query = f'{site_query} "{q}" "{location}"'
+    if boosters2:
+        query += f" {boosters2}"
+    if radius_hint:
+        query += f" {radius_hint}"
+
     params = {"engine": "google", "q": query, "api_key": sa_key, "hl": hl, "gl": gl}
     res = serpapi_get(params)
     organic = res.get("organic_results", []) or []
-
-    # Fallback if 0 results: remove radius hint + booster first
-    if not organic:
-        query2 = _build_web_query(site_query, q, location, "", "")
-        params2 = {"engine": "google", "q": query2, "api_key": sa_key, "hl": hl, "gl": gl}
-        res2 = serpapi_get(params2)
-        organic = res2.get("organic_results", []) or []
-
     out: List[Dict[str, Any]] = []
     for r in organic[:num]:
         out.append({
@@ -990,6 +885,10 @@ def build_candidate_dossier(oa_key: str, docs_text: str) -> dict:
 Erstelle ein Kandidaten-Dossier (DE) als JSON aus ALLEN Dokumenten.
 Nutze CV + Zeugnisse + Zertifikate. Keine PII.
 
+WICHTIG:
+- Bei skills/tools bitte konkrete Keywords aufnehmen (z.B. Python, OpenCV, Calibration, Testing, VBA, CAN, HIL, MATLAB etc.), falls erkennbar.
+- Bitte auch "target_titles" sehr konkret (5-12 Titel) formulieren.
+
 JSON:
 {
  "name_label":"",
@@ -1011,6 +910,34 @@ JSON:
     resp = client.chat.completions.create(
         model="gpt-4o",
         messages=[{"role": "user", "content": prompt + "\n\n" + truncate_text(docs_text, 70000)}],
+        response_format={"type": "json_object"},
+    )
+    return json.loads(resp.choices[0].message.content)
+
+
+@st.cache_data(ttl=6 * 3600, show_spinner=False)
+def propose_search_plan_cached(oa_key: str, dossier_json: str) -> dict:
+    """
+    Returns JSON: { "queries":[...], "boosters":[...], "negative":[...] }
+    """
+    dossier = safe_json_loads(dossier_json) or {}
+    client = get_client(oa_key)
+    prompt = f"""
+Du bist aggressiver Reverse-Recruiter (DE/EN). Ziel: sehr treffsichere Suchbegriffe für Jobbörsen.
+Gib NUR JSON zurück:
+
+{{
+ "queries": ["... max 12, job titles / roles, gemischt DE/EN ok, sehr konkret"],
+ "boosters": ["... max 14, keywords/skills/industries (z.B. testing, calibration, python, openCV, validation, automotive, ADAS...)"],
+ "negative": ["... max 10, irrelevante Rollen zum Ausschließen (z.B. pflege, krankenpfleger, vertrieb, ... )"]
+}}
+
+KANDIDAT DOSSIER:
+{json.dumps(dossier, ensure_ascii=False)}
+"""
+    resp = client.chat.completions.create(
+        model="gpt-4o",
+        messages=[{"role": "user", "content": prompt}],
         response_format={"type": "json_object"},
     )
     return json.loads(resp.choices[0].message.content)
@@ -1053,15 +980,14 @@ Du bist Lead-Recruiter. Gib ZWEI Scores:
 
 1) raw_match_percent (0-100):
    - semantische Passung Skills/Titel/Branche
-   - darf 90+ sein, auch wenn nicht jede Evidenz perfekt ist
+   - darf 90+ sein, wenn Rolle sehr gut passt
 
 2) strict_match_percent (0-100):
    - 90+ nur wenn:
-     a) Must-Haves weight>=4 erfüllt
-     b) keine Constraint-Blocker
+     a) Must-Haves weight>=4 erfüllt ODER klar sehr nah erfüllt (gleichwertige Erfahrung)
+     b) keine Constraint-Blocker (z.B. Sprache/Standort/Schicht/Travel)
      c) Evidence für Top-Must-Haves erkennbar
-   - wenn Jobtext dünn ist: strict darf NICHT hoch sein
-   - ABER: wenn Jobtext ordentlich ist und Kandidat klar passt, darf strict 90+ sein
+   - wenn Jobtext dünn ist: strict konservativ
 
 Gib JSON:
 {{
@@ -1481,29 +1407,47 @@ def render_market_scan(workspace_id: str, oa_key: str, sa_key: str):
 
     st.caption(f"Kandidat: {search.get('name','')} | Workflow: {search.get('candidate_group_id','')}")
 
-    c1, c2 = st.columns(2)
-    q = c1.text_input("Job-Titel (Komma möglich)", value=search.get("q", ""))
-    l = c2.text_input("Standort (Zentrum)", value=search.get("l", ""))
-
+    # --- Relevanz & Suchqualität ---
     st.subheader("🎯 Relevanz & Suchqualität")
-    booster_default = st.session_state.get("booster_terms", "")
-    booster = st.text_input(
-        "Booster (Keywords – erhöht Relevanz, z.B. Testing Calibration Python DO160)",
-        value=booster_default,
-        help="Diese Begriffe werden locker in Web-Queries ergänzt (nicht als harte Muss-Wörter)."
-    )
-    st.session_state["booster_terms"] = booster
 
-    strict_title_filter = st.toggle(
-        "✅ Harte Titel-Relevanz (empfohlen)",
-        value=True,
-        help="Filtert Ergebnisse raus, deren Titel nicht zu deinen Query-Wörtern passt (stoppt Pflege/Off-Topic)."
+    # boosters default from session
+    if "scan_boosters" not in st.session_state:
+        st.session_state.scan_boosters = ""
+
+    cA, cB = st.columns([2, 1])
+    boosters = cA.text_input(
+        "Booster (Keywords, optional)",
+        value=st.session_state.get("scan_boosters", ""),
+        help="Keywords erhöhen Trefferqualität (z.B. testing calibration python openCV validation automotive ADAS).",
     )
-    apply_title_filter_to_google_jobs = st.toggle(
-        "Auch Google Jobs streng filtern",
-        value=True,
-        help="Wenn aktiviert, werden auch Google-Jobs Treffer per Title-Gate gefiltert."
+    relevance_mode = cB.selectbox(
+        "Relevanzfilter",
+        ["Aus", "Soft (irgend ein Query-Wort)", "Strict (alle Query-Wörter im Titel)"],
+        index=2,
+        help="Strict entfernt irrelevante Treffer wie Pflege/Service, wenn Query z.B. 'Ingenieur' ist.",
     )
+    st.session_state.scan_boosters = boosters
+
+    if dossier and st.button("🤖 Suchplan aus Dossier (Auto-Queries + Booster)", use_container_width=True):
+        try:
+            plan = propose_search_plan_cached(oa_key, search.get("dossier_json", ""))
+            qs = plan.get("queries", []) or []
+            bs = plan.get("boosters", []) or []
+            # Set into UI (queries as comma list; boosters as space list)
+            if qs:
+                st.session_state["auto_queries_from_dossier"] = ", ".join([str(x) for x in qs[:10]])
+            if bs:
+                st.session_state.scan_boosters = " ".join([str(x) for x in bs[:12]])
+            st.success("Suchplan gesetzt. Scroll nach unten und starte Scan.")
+        except Exception:
+            st.warning("Konnte Suchplan nicht generieren (Key/Quota/Netz).")
+
+    st.divider()
+
+    c1, c2 = st.columns(2)
+    q_default = st.session_state.get("auto_queries_from_dossier", search.get("q", ""))
+    q = c1.text_input("Job-Titel (Komma möglich)", value=q_default)
+    l = c2.text_input("Standort (Zentrum)", value=search.get("l", ""))
 
     r1, r2 = st.columns([1, 2])
     radius_km = r1.slider("Umkreis (km)", 0, 150, 50, 5)
@@ -1514,12 +1458,8 @@ def render_market_scan(workspace_id: str, oa_key: str, sa_key: str):
     )
 
     radius_hint_web = ""
-    radius_hint_jobs = ""
     if radius_km > 0 and "Query" in radius_mode:
         radius_hint_web = f' ("Umkreis {radius_km} km" OR "{radius_km} km" OR "within {radius_km} km" OR "near {l}")'
-        radius_hint_jobs = f" Umkreis {radius_km} km"
-
-    if radius_km > 0 and "Query" in radius_mode:
         st.info(f"📍 Radius aktiv: {radius_km} km um {l} (Hinweis: Web-Search Radius ist best effort)")
 
     st.caption("Quellen")
@@ -1529,10 +1469,14 @@ def render_market_scan(workspace_id: str, oa_key: str, sa_key: str):
     use_indeed = s3.toggle("Indeed (web)", value=True)
     use_stepstone = s4.toggle("StepStone (web)", value=True)
 
+    if not any([use_google_jobs, use_linkedin, use_indeed, use_stepstone]):
+        st.warning("Keine Quelle aktiv → aktiviere mindestens Google Jobs.")
+        use_google_jobs = True
+
     st.divider()
     a, b, c = st.columns(3)
-    max_results = a.slider("Max Ergebnisse (gesamt)", 10, 120, 50, 10)
-    per_board = b.slider("Max pro Quelle", 5, 30, 12, 1)
+    max_results = a.slider("Max Ergebnisse (gesamt)", 10, 120, 40, 10)
+    per_board = b.slider("Max pro Quelle", 5, 30, 10, 5)
     only_real = c.toggle("✅ Nur echte Einzelanzeigen (strict)", value=True)
 
     st.divider()
@@ -1543,99 +1487,135 @@ def render_market_scan(workspace_id: str, oa_key: str, sa_key: str):
     hot_threshold = st.slider("Hot Threshold (strict %)", 80, 99, 90, 1)
     min_conf = st.selectbox("Min Confidence für Hot", ["medium", "high"], index=0)
 
+    # extra: cut obvious trash
+    min_raw_keep = st.slider("Min Raw% (Filter nach Matching)", 0, 80, 20, 5)
+    min_strict_keep = st.slider("Min Strict% (Filter nach Matching)", 0, 80, 10, 5)
+
     st.session_state.hot_threshold = hot_threshold
     st.session_state.min_conf = min_conf
 
     if auto_match and not dossier:
         st.warning("Dossier fehlt. Im Screening zuerst 'Dossier erstellen' und speichern.")
 
+    debug_mode = st.toggle("Debug anzeigen", value=False)
+
     if st.button("🚀 Scan starten", use_container_width=True):
-        base_queries = [x.strip() for x in (q or "").split(",") if x.strip()]
-        if not base_queries:
+        queries = [x.strip() for x in (q or "").split(",") if x.strip()]
+        if not queries:
             st.warning("Bitte mindestens einen Jobtitel eingeben.")
             return
 
-        query_variants = build_query_variants(base_queries, booster, dossier)
-        st.session_state["last_scan_debug"] = {"base_queries": base_queries, "query_variants": query_variants, "location": l, "radius_km": radius_km}
+        # normalize boosters a bit
+        boosters_txt = (boosters or "").strip()
+        boosters_txt = re.sub(r"[,\s]+", " ", boosters_txt).strip()
+        boosters_txt = boosters_txt[:250]
+
+        debug_used_queries: List[str] = []
+        source_counts = {"Google Jobs": 0, "LinkedIn": 0, "Indeed": 0, "StepStone": 0}
 
         all_jobs: List[Dict[str, Any]] = []
         with st.spinner("Suche Jobs..."):
-            for qi in query_variants:
-                if use_google_jobs:
-                    all_jobs += fetch_google_jobs(sa_key, qi + radius_hint_jobs, l)
+            for qi in queries:
+                qi_clean = qi.strip()
 
+                # Google Jobs: keep query clean (radius via param), boosters NOT appended to q (hurts recall)
+                if use_google_jobs:
+                    debug_used_queries.append(f"GoogleJobs: q='{qi_clean}' loc='{l}' radius={radius_km}")
+                    gj = fetch_google_jobs(sa_key, qi_clean, l, radius_km=radius_km)
+                    source_counts["Google Jobs"] += len(gj)
+                    all_jobs += gj
+
+                # Web boards: boosters help precision
                 if use_linkedin:
-                    all_jobs += fetch_site_jobs(
-                        sa_key, qi, l,
-                        "site:linkedin.com/jobs (jobs/view OR currentjobid OR jobPostingId)",
+                    debug_used_queries.append(f"LinkedInWeb: q='{qi_clean}' loc='{l}' boosters='{boosters_txt}'")
+                    li = fetch_site_jobs(
+                        sa_key, qi_clean, l,
+                        'site:linkedin.com/jobs (jobs/view OR currentjobid)',
                         "LinkedIn",
                         radius_hint=radius_hint_web,
-                        booster=booster,
+                        boosters=boosters_txt,
                         num=per_board
                     )
+                    source_counts["LinkedIn"] += len(li)
+                    all_jobs += li
+
                 if use_indeed:
-                    all_jobs += fetch_site_jobs(
-                        sa_key, qi, l,
-                        "(site:indeed.com OR site:indeed.de) (viewjob OR jk=)",
+                    debug_used_queries.append(f"IndeedWeb: q='{qi_clean}' loc='{l}' boosters='{boosters_txt}'")
+                    ind = fetch_site_jobs(
+                        sa_key, qi_clean, l,
+                        '(site:indeed.com OR site:indeed.de) (viewjob OR jk=)',
                         "Indeed",
                         radius_hint=radius_hint_web,
-                        booster=booster,
+                        boosters=boosters_txt,
                         num=per_board
                     )
+                    source_counts["Indeed"] += len(ind)
+                    all_jobs += ind
+
                 if use_stepstone:
-                    all_jobs += fetch_site_jobs(
-                        sa_key, qi, l,
-                        "site:stepstone.de (stellenangebote OR job)",
+                    debug_used_queries.append(f"StepStoneWeb: q='{qi_clean}' loc='{l}' boosters='{boosters_txt}'")
+                    ss = fetch_site_jobs(
+                        sa_key, qi_clean, l,
+                        'site:stepstone.de (stellenangebote OR job)',
                         "StepStone",
                         radius_hint=radius_hint_web,
-                        booster=booster,
+                        boosters=boosters_txt,
                         num=per_board
                     )
+                    source_counts["StepStone"] += len(ss)
+                    all_jobs += ss
 
         all_jobs = dedupe_jobs(all_jobs)
-
-        # ----- relevance gates BEFORE expensive matching -----
-        if strict_title_filter:
-            kept = []
-            for j in all_jobs:
-                src = normalize_source_label(j.get("source", ""))
-                title = j.get("title", "") or ""
-                if is_banned_by_irrelevance(title, base_queries, booster):
-                    continue
-                if (src == "Google Jobs") and (not apply_title_filter_to_google_jobs):
-                    kept.append(j)
-                    continue
-                if title_matches_any_query(title, base_queries):
-                    kept.append(j)
-                    continue
-            all_jobs = kept
-
-        # ensure real postings on web sources
         all_jobs_raw = list(all_jobs)
+
+        if not all_jobs:
+            st.warning("SerpApi lieferte 0 Treffer. Check: Suchbegriffe/Ort/Quellen/SerpApi-Key.")
+            if debug_mode and debug_used_queries:
+                with st.expander("Debug: Queries"):
+                    st.code("\n".join(debug_used_queries))
+            return
+
+        # 1) strict posting filter
         if only_real:
             kept = []
             for j in all_jobs:
-                src = normalize_source_label(j.get("source", ""))
-                if src == "Google Jobs":
+                if normalize_source_label(j.get("source", "")) == "Google Jobs":
                     kept.append(j)
                     continue
                 if is_probably_job_posting(j.get("link", ""), j.get("title", ""), j.get("snippet", ""), j.get("source", "")):
                     kept.append(j)
             all_jobs = kept
 
-        # if filters wipe everything, fallback to raw list
-        if not all_jobs and all_jobs_raw:
-            st.warning("Filter war zu streng → verwende ungefilterte Treffer (toggle deaktivieren für mehr).")
+        if not all_jobs:
+            st.warning("Filter 'Nur echte Einzelanzeigen' war zu streng → verwende ungefilterte Treffer.")
             all_jobs = all_jobs_raw
 
+        # 2) relevance filter (kills Pflege/Service etc)
+        if relevance_mode != "Aus":
+            before = len(all_jobs)
+            kept2 = []
+            for j in all_jobs:
+                src = normalize_source_label(j.get("source", ""))
+                title = j.get("title", "") or ""
+                snippet = j.get("snippet", "") or ""
+                # apply to all sources (including Google Jobs) to avoid random junk
+                if relevance_mode.startswith("Strict"):
+                    if title_matches_any_query(title, queries):
+                        kept2.append(j)
+                else:
+                    if text_matches_query_soft(title + " " + snippet, queries):
+                        kept2.append(j)
+
+            if kept2:
+                all_jobs = kept2
+            else:
+                # don't destroy recall completely; keep originals if it would be 0
+                st.info(f"Relevanzfilter hätte alles entfernt (vorher {before}). Behalte Originale.")
+
         if not all_jobs:
-            st.warning("Keine Ergebnisse. Tipp: Query konkreter machen (z.B. 'Testingenieur' statt 'Ingenieur') und Booster setzen.")
-            dbg = st.session_state.get("last_scan_debug", {})
-            with st.expander("Debug (gesendete Query-Varianten)"):
-                st.json(dbg)
+            st.warning("Keine Ergebnisse nach Filtern. Toggle Relevanzfilter/Einzelanzeigen deaktivieren.")
             return
 
-        # ----- Matching + enrichment -----
         enriched: List[Dict[str, Any]] = []
         with st.spinner("Matching..."):
             for j in all_jobs:
@@ -1685,14 +1665,28 @@ def render_market_scan(workspace_id: str, oa_key: str, sa_key: str):
 
                 enriched.append(j)
 
-        enriched = dedupe_jobs(enriched)
+        # drop obvious trash after matching (optional)
+        if auto_match and dossier:
+            filtered = []
+            for j in enriched:
+                s = safe_int(j.get("_match_percent", -1), -1)
+                r = safe_int(j.get("_raw_match_percent", -1), -1)
+                if (s >= min_strict_keep) or (r >= min_raw_keep) or j.get("_hot"):
+                    filtered.append(j)
+            if filtered:
+                enriched = filtered
+
         enriched.sort(key=score_sort_key, reverse=True)
         enriched = enriched[:max_results]
 
         st.session_state.scan_results = enriched
         st.success(f"{len(enriched)} Ergebnisse in Review-Queue gelegt.")
-        with st.expander("Debug (Query-Varianten)"):
-            st.json(st.session_state.get("last_scan_debug", {}))
+
+        if debug_mode:
+            with st.expander("Debug: Source counts / Queries"):
+                st.write(source_counts)
+                st.code("\n".join(debug_used_queries[:40]))
+
         st.info("Weiter zu: Review-Queue")
 
 
